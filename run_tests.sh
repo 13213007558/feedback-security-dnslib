@@ -16,6 +16,13 @@ done
 
 for py in $VERSIONS
 do
+    echo "=== test_zoneresolver.py"
+    echo "Testing:" $($py --version 2>&1)
+    $py -m dnslib.test_zoneresolver
+done
+
+for py in $VERSIONS
+do
     echo "Fuzz:" $($py --version 2>&1)
     $py fuzz.py
 done

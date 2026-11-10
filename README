@@ -292,7 +292,9 @@ object and returns a response.
 A number of sample resolvers are provided as examples (see CLI --help):
 
  * dnslib.fixedresolver    - Respond to all requests with fixed response
- * dnslib.zoneresolver     - Respond from Zone file
+ * dnslib.zoneresolver     - Respond from Zone file (exact/glob match or
+                            RFC 1034/4592 wildcard zone semantics with
+                            --wildcard)
  * dnslib.shellresolver    - Call shell script to generate response
 
 The library includes a number of client utilities:

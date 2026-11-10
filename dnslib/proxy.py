@@ -4,8 +4,64 @@ from __future__ import print_function
 
 import binascii,socket,struct
 
-from dnslib import DNSRecord,RCODE,QTYPE
+from dnslib import DNSRecord,DNSHeader,DNSError,RCODE,QTYPE
 from dnslib.server import DNSServer,DNSHandler,BaseResolver,DNSLogger
+
+def validate_reply(request,reply):
+    """
+        Validate that an upstream response belongs to the supplied request.
+
+        Checks (per RFC1035/RFC5452):
+          - transaction id matches
+          - response is a response (QR=1) with the same opcode as the request
+          - question section matches exactly (name compared case-insensitively
+            per DNS label rules, plus qtype/qclass), including multi-question
+            packets and empty question sections
+
+        Raises DNSError if the response cannot be correlated with the request.
+        Answer/authority/additional sections are not inspected so legitimate
+        unknown RR types and additional records (eg EDNS OPT) are preserved.
+    """
+    if request.header.id != reply.header.id:
+        raise DNSError("Upstream response transaction id does not match "
+                       "request (request=%d response=%d)" % (
+                                    request.header.id,reply.header.id))
+    if reply.header.qr != 1:
+        raise DNSError("Upstream response QR flag is not set")
+    if request.header.opcode != reply.header.opcode:
+        raise DNSError("Upstream response opcode does not match request "
+                       "(request=%s response=%s)" % (
+                                    request.header.opcode,reply.header.opcode))
+    if len(request.questions) != len(reply.questions):
+        raise DNSError("Upstream response question count does not match "
+                       "request (request=%d response=%d)" % (
+                                    len(request.questions),
+                                    len(reply.questions)))
+    for index,(q1,q2) in enumerate(zip(request.questions,reply.questions)):
+        # DNSLabel.__eq__ implements the DNS case-insensitive name rules
+        if q1.qname != q2.qname or q1.qtype != q2.qtype or \
+           q1.qclass != q2.qclass:
+            raise DNSError("Upstream response question %d does not match "
+                           "request (request=%r response=%r)" % (
+                                    index,q1,q2))
+    return reply
+
+def servfail(request):
+    """
+        Build a SERVFAIL skeleton reply for an upstream failure
+        (timeout/truncated/mismatched/invalid response). This is deliberately
+        distinct from an upstream NXDOMAIN, which means the name genuinely
+        does not exist and must be forwarded unchanged.
+    """
+    if request.questions:
+        reply = request.reply()
+    else:
+        # request.reply() would synthesise an empty question section
+        reply = DNSRecord(DNSHeader(id=request.header.id,
+                                    bitmap=request.header.bitmap,
+                                    qr=1))
+    reply.header.rcode = RCODE.SERVFAIL
+    return reply
 
 class ProxyResolver(BaseResolver):
     """
@@ -27,12 +83,17 @@ class ProxyResolver(BaseResolver):
         'real' transparent proxy option the DNSHandler logic needs to be
         modified (see PassthroughDNSHandler)
 
+        Upstream responses are validated against the request (transaction id,
+        QR/opcode and question section) before being returned. Upstream
+        timeouts, truncated reads or mismatched/invalid responses result in
+        SERVFAIL rather than being confused with an upstream NXDOMAIN.
+
     """
 
     def __init__(self,address,port,timeout=0,strip_aaaa=False):
         self.address = address
         self.port = port
-        self.timeout = timeout
+        self.timeout = timeout or None
         self.strip_aaaa = strip_aaaa
 
     def resolve(self,request,handler):
@@ -47,10 +108,12 @@ class ProxyResolver(BaseResolver):
                 else:
                     proxy_r = request.send(self.address,self.port,
                                     tcp=True,timeout=self.timeout)
-                reply = DNSRecord.parse(proxy_r)
+                reply = validate_reply(request,DNSRecord.parse(proxy_r))
         except socket.timeout:
-            reply = request.reply()
-            reply.header.rcode = getattr(RCODE,'NXDOMAIN')
+            reply = servfail(request)
+        except (socket.error,DNSError):
+            # Truncated/closed connection, unparseable or mismatched response
+            reply = servfail(request)
 
         return reply
 
@@ -60,26 +123,37 @@ class PassthroughDNSHandler(DNSHandler):
         upstream DNS server rather then decoding/encoding packet and
         passing to Resolver (The request/response packets are still
         parsed and logged but this is not inline)
+
+        The raw upstream response is only forwarded when it validates against
+        the request (transaction id, QR/opcode and question section). On an
+        upstream timeout, truncated read or mismatched/invalid response the
+        client receives a SERVFAIL reply instead of an unrelated or forged
+        packet. Valid responses (including NXDOMAIN and unknown RR types) are
+        forwarded byte-for-byte with their additional records intact.
     """
     def get_reply(self,data):
         host,port = self.server.resolver.address,self.server.resolver.port
+        timeout = self.server.resolver.timeout
 
         request = DNSRecord.parse(data)
         self.server.logger.log_request(self,request)
 
-        if self.protocol == 'tcp':
-            data = struct.pack("!H",len(data)) + data
-            response = send_tcp(data,host,port)
-            response = response[2:]
-        else:
-            response = send_udp(data,host,port)
+        try:
+            if self.protocol == 'tcp':
+                tcp_data = struct.pack("!H",len(data)) + data
+                response = send_tcp(tcp_data,host,port,timeout=timeout)[2:]
+            else:
+                response = send_udp(data,host,port,timeout=timeout)
 
-        reply = DNSRecord.parse(response)
-        self.server.logger.log_reply(self,reply)
+            reply = validate_reply(request,DNSRecord.parse(response))
+            self.server.logger.log_reply(self,reply)
+        except (socket.timeout,socket.error,DNSError) as e:
+            self.server.logger.log_error(self,e)
+            response = servfail(request).pack()
 
         return response
 
-def send_tcp(data,host,port):
+def send_tcp(data,host,port,timeout=None):
     """
         Helper function to send/receive DNS TCP request
         (in/out packets will have prepended TCP length header)
@@ -87,26 +161,39 @@ def send_tcp(data,host,port):
     sock = None
     try:
         sock = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        if timeout is not None:
+            sock.settimeout(timeout)
         sock.connect((host,port))
         sock.sendall(data)
         response = sock.recv(8192)
+        if not response:
+            raise DNSError("Upstream TCP connection closed before response")
         length = struct.unpack("!H",bytes(response[:2]))[0]
         while len(response) - 2 < length:
-            response += sock.recv(8192)
+            chunk = sock.recv(8192)
+            if not chunk:
+                raise DNSError("Upstream TCP response truncated "
+                               "(expected %d bytes, got %d)" % (
+                                    length,len(response) - 2))
+            response += chunk
         return response
     finally:
         if (sock is not None):
             sock.close()
 
-def send_udp(data,host,port):
+def send_udp(data,host,port,timeout=None):
     """
         Helper function to send/receive DNS UDP request
     """
     sock = None
     try:
         sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        if timeout is not None:
+            sock.settimeout(timeout)
         sock.sendto(data,(host,port))
         response,server = sock.recvfrom(8192)
+        if not response:
+            raise DNSError("Empty UDP response from upstream")
         return response
     finally:
         if (sock is not None):

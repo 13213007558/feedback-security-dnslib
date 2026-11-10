@@ -382,9 +382,17 @@ class DNSRecord(object):
                 sock.connect((dest,port))
                 sock.sendall(data)
                 response = sock.recv(8192)
+                if not response:
+                    raise DNSError("Upstream TCP connection closed "
+                                   "before response")
                 length = struct.unpack("!H",bytes(response[:2]))[0]
                 while len(response) - 2 < length:
-                    response += sock.recv(8192)
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        raise DNSError("Upstream TCP response truncated "
+                                       "(expected %d bytes, got %d)" % (
+                                            length,len(response) - 2))
+                    response += chunk
                 response = response[2:]
             else:
                 sock = socket.socket(inet,socket.SOCK_DGRAM)

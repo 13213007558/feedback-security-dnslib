@@ -276,6 +276,10 @@ class DNSBuffer(Buffer):
                     raise BufferError("Recursive pointer in DNSLabel [offset=%d,pointer=%d,length=%d]" %
                             (self.offset,pointer,len(self.data)))
                 if pointer < self.offset:
+                    # Pointers may legitimately reference names elsewhere in
+                    # the packet (outside the local RDATA read window), so the
+                    # RDATA limit only applies to the bytes consumed locally
+                    limit = self.save_limit()
                     self.offset = pointer
                 else:
                     # Pointer can't point forwards
@@ -283,6 +287,7 @@ class DNSBuffer(Buffer):
                             (self.offset,pointer,len(self.data)))
                 label.extend(self.decode_name(save).label)
                 self.offset = save
+                self.restore_limit(limit)
                 done = True
             else:
                 if length > 0:

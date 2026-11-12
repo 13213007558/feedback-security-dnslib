@@ -48,20 +48,50 @@ class Buffer(object):
         """
         self.data = bytearray(data)
         self.offset = 0
+        # Optional hard limit (absolute offset) on sequential reads.
+        # Used to constrain RDATA parsing to the declared RDLENGTH;
+        # compression pointer lookups are exempted via save_limit/restore_limit
+        self.limit = len(self.data)
 
     def remaining(self):
         """
             Return bytes remaining
         """
-        return len(self.data) - self.offset
+        return max(0,min(self.limit,len(self.data)) - self.offset)
+
+    def set_limit(self,end):
+        """
+            Set an absolute read limit at offset 'end' (returns previous limit)
+        """
+        if end > len(self.data):
+            raise BufferError("Read limit beyond end of buffer [limit=%d,length=%d]" %
+                    (end,len(self.data)))
+        previous = self.limit
+        self.limit = end
+        return previous
+
+    def save_limit(self):
+        """
+            Remove the read limit (returning previous value) - used while
+            following a compression pointer outside the local read window
+        """
+        previous = self.limit
+        self.limit = len(self.data)
+        return previous
+
+    def restore_limit(self,limit):
+        """
+            Restore a previously saved read limit
+        """
+        self.limit = limit
 
     def get(self,length):
         """
             Gen len bytes at current offset (& increment offset)
         """
         if length > self.remaining():
-            raise BufferError("Not enough bytes [offset=%d,remaining=%d,requested=%d]" %
-                    (self.offset,self.remaining(),length))
+            raise BufferError("Not enough bytes [offset=%d,remaining=%d,requested=%d,limit=%d]" %
+                    (self.offset,self.remaining(),length,self.limit))
         start = self.offset
         end = self.offset + length
         self.offset += length
@@ -80,6 +110,7 @@ class Buffer(object):
         """
         self.offset += struct.calcsize(fmt)
         self.data += struct.pack(fmt,*args)
+        self.limit += struct.calcsize(fmt)
 
     def append(self,s):
         """
@@ -87,6 +118,7 @@ class Buffer(object):
         """
         self.offset += len(s)
         self.data += s
+        self.limit += len(s)
 
     def update(self,ptr,fmt,*args):
         """

@@ -812,9 +812,16 @@ class RR(object):
 
     @classmethod
     def parse(cls,buffer):
+        rtype = None
         try:
             rname = buffer.decode_name()
             rtype,rclass,ttl,rdlength = buffer.unpack("!HHIH")
+            if rdlength > buffer.remaining():
+                raise DNSError(
+                    "Error unpacking RR [offset=%d,rtype=%s]: RDLENGTH %d exceeds remaining packet data %d" %
+                        (buffer.offset,QTYPE.get(rtype),rdlength,buffer.remaining()))
+            rdata_start = buffer.offset
+            rdata_end = rdata_start + rdlength
             if rtype == QTYPE.OPT:
                 options = []
                 option_buffer = Buffer(buffer.get(rdlength))
@@ -825,14 +832,25 @@ class RR(object):
                 rdata = options
             else:
                 if rdlength:
-                    rdata = RDMAP.get(QTYPE.get(rtype),RD).parse(
-                                            buffer,rdlength)
+                    previous_limit = buffer.set_limit(rdata_end)
+                    try:
+                        rdata = RDMAP.get(QTYPE.get(rtype),RD).parse(
+                                                buffer,rdlength)
+                    finally:
+                        buffer.restore_limit(previous_limit)
+                    if buffer.offset != rdata_end:
+                        raise DNSError(
+                            "Error unpacking RR [offset=%d,rtype=%s,rdlength=%d]: RDATA consumed %d bytes (must consume exactly RDLENGTH)" %
+                                (rdata_start,QTYPE.get(rtype),rdlength,
+                                        buffer.offset - rdata_start))
                 else:
                     raise DNSError("Error: Empty RR")
             return cls(rname,rtype,rclass,ttl,rdata)
         except (BufferError,BimapError) as e:
-            raise DNSError("Error unpacking RR [offset=%d]: %s" % (
-                                buffer.offset,e))
+            raise DNSError("Error unpacking RR [offset=%d,rtype=%s]: %s" % (
+                                buffer.offset,
+                                QTYPE.get(rtype) if rtype is not None else '?',
+                                e))
 
     @classmethod
     def fromZone(cls,zone,origin="",ttl=0):
@@ -1119,16 +1137,16 @@ class TXT(RD):
         try:
             data = list()
             start_bo = buffer.offset
-            now_length = 0
-            while buffer.offset < start_bo + length:
+            end_bo = start_bo + length
+            while buffer.offset < end_bo:
                 (txtlength,) = buffer.unpack("!B")
-                # First byte is TXT length (not in RFC?)
-                if now_length + txtlength < length:
-                    now_length += txtlength
-                    data.append(buffer.get(txtlength))
-                else:
-                    raise DNSError("Invalid TXT record: len(%d) > RD len(%d)" %
-                                            (txtlength,length))
+                if buffer.offset + txtlength > end_bo:
+                    raise DNSError("Invalid TXT record [offset=%d,rdlength=%d]: character-string length %d exceeds RDATA bounds" %
+                                            (start_bo,length,txtlength))
+                data.append(buffer.get(txtlength))
+            if buffer.offset != end_bo:
+                raise DNSError("Invalid TXT record [offset=%d,rdlength=%d]: incomplete character-string" %
+                                            (start_bo,length))
             return cls(data)
         except (BufferError,BimapError) as e:
             raise DNSError("Error unpacking TXT [offset=%d]: %s" %
@@ -1907,6 +1925,9 @@ class HTTPS(RD):
             priority, = buffer.unpack("!H")
             target = []
             while True:
+                if buffer.offset >= end:
+                    raise DNSError("Invalid HTTPS record [offset=%d,rdlength=%d]: unterminated target name" %
+                                            (end - length,length))
                 n, = buffer.unpack("B")
                 if n == 0:
                     break
@@ -1916,6 +1937,9 @@ class HTTPS(RD):
             while buffer.offset < end:
                 k, = buffer.unpack("!H")
                 n, = buffer.unpack("!H")
+                if buffer.offset + n > end:
+                    raise DNSError("Invalid HTTPS record [offset=%d,rdlength=%d]: SvcParam (key=%d) length %d exceeds RDATA bounds" %
+                                            (end - length,length,k,n))
                 v = bytearray(buffer.get(n))
                 params.append((k, v))
             return cls(priority, target, params)
